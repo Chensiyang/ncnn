@@ -88,31 +88,23 @@ int Convolution::load_model(const ModelBin& mb)
 
     if (weight_data_is_float32 && use_int8_inference)
     {
-        if (weight_data_int8_scale != 0.f && bottom_blob_int8_scale != 0.f)
-        {
-            // quantize weight to int8
-            Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
+        // quantize weight to int8
+        Layer* op = ncnn::create_layer(ncnn::LayerType::Quantize);
 
-            ncnn::ParamDict pd;
-            pd.set(0, weight_data_int8_scale);// scale
+        ncnn::ParamDict pd;
+        pd.set(0, weight_data_int8_scale);// scale
 
-            op->load_param(pd);
+        op->load_param(pd);
 
-            Mat int8_weight_data;
-            op->forward(weight_data, int8_weight_data);
+        Mat int8_weight_data;
+        op->forward(weight_data, int8_weight_data);
 
-            delete op;
+        delete op;
 
-            if (int8_weight_data.empty())
-                return -100;
+        if (int8_weight_data.empty())
+            return -100;
 
-            weight_data = int8_weight_data;
-        }
-        else
-        {
-            // plain float32 weight, fallback to float32 inference
-            use_int8_inference = false;
-        }
+        weight_data = int8_weight_data;
     }
 
     if (use_int8_inference)
@@ -203,10 +195,29 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
     const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
     const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
 
-    Mat bottom_blob_bordered = bottom_blob;
+    Mat bottom_blob_unbordered = bottom_blob;
+    if (use_int8_inference && elemsize != 1)
+    {
+        Mat bottom_blob_int8;
+        bottom_blob_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
+        if (bottom_blob_int8.empty())
+            return -100;
+
+        // quantize, scale and round to nearest
+        {
+            ncnn::Option opt_g = opt;
+            opt_g.blob_allocator = bottom_blob_int8.allocator;
+
+            quantize->forward(bottom_blob, bottom_blob_int8, opt_g);
+        }
+
+        bottom_blob_unbordered = bottom_blob_int8;
+    }
+
+    Mat bottom_blob_bordered = bottom_blob_unbordered;
     if (pad_w > 0 || pad_h > 0)
     {
-        copy_make_border(bottom_blob, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
+        copy_make_border(bottom_blob_unbordered, bottom_blob_bordered, pad_h, pad_h, pad_w, pad_w, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
         if (bottom_blob_bordered.empty())
             return -100;
 
@@ -219,7 +230,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
         int hpad = kernel_extent_h + (h - 1) / stride_h * stride_h - h;
         if (wpad > 0 || hpad > 0)
         {
-            copy_make_border(bottom_blob, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
+            copy_make_border(bottom_blob_unbordered, bottom_blob_bordered, hpad / 2, hpad - hpad / 2, wpad / 2, wpad - wpad / 2, BORDER_CONSTANT, 0.f, opt.workspace_allocator, opt.num_threads);
             if (bottom_blob_bordered.empty())
                 return -100;
         }
@@ -258,19 +269,6 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
 
     if (use_int8_inference)
     {
-        Mat bottom_blob_bordered_int8;
-        bottom_blob_bordered_int8.create(w, h, channels, (size_t)1u, opt.workspace_allocator);
-        if (bottom_blob_bordered_int8.empty())
-            return -100;
-
-        // quantize, scale and round to nearest
-        {
-            ncnn::Option opt_g = opt;
-            opt_g.blob_allocator = bottom_blob_bordered_int8.allocator;
-
-            quantize->forward(bottom_blob_bordered, bottom_blob_bordered_int8, opt_g);
-        }
-
         // num_output
         #pragma omp parallel for num_threads(opt.num_threads)
         for (int p=0; p<num_output; p++)
@@ -288,7 +286,7 @@ int Convolution::forward(const Mat& bottom_blob, Mat& top_blob, const Option& op
                     // channels
                     for (int q=0; q<channels; q++)
                     {
-                        const Mat m = bottom_blob_bordered_int8.channel(q);
+                        const Mat m = bottom_blob_bordered.channel(q);
                         const signed char* sptr = m.row<signed char>(i*stride_h) + j*stride_w;
 
                         for (int k = 0; k < maxk; k++)
